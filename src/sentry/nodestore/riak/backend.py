@@ -2,91 +2,91 @@
 sentry.nodestore.riak.backend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-:copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
+:copyright: (c) 2010-2015 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
 
 from __future__ import absolute_import
 
-import riak
-import riak.resolver
-
 import six
 
-from time import sleep
+from simplejson import JSONEncoder, _default_decoder
 
 from sentry.nodestore.base import NodeStorage
-from sentry.utils.cache import memoize
+from .client import RiakClient
 
 
-# Riak commonly has timeouts or non-200 HTTP errors. Being that almost
-# always our messages are immutable, it's safe to simply retry in many
-# cases
-def retry(attempts, func, *args, **kwargs):
-    for _ in range(attempts):
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            sleep(0.01)
-    raise
+# Cache an instance of the encoder we want to use
+json_dumps = JSONEncoder(
+    separators=(',', ':'),
+    skipkeys=False,
+    ensure_ascii=True,
+    check_circular=True,
+    allow_nan=True,
+    indent=None,
+    encoding='utf-8',
+    default=None,
+).encode
+
+json_loads = _default_decoder.decode
 
 
 class RiakNodeStorage(NodeStorage):
     """
     A Riak-based backend for storing node data.
 
-    >>> RiakNodeStorage(nodes=[{'host':'127.0.0.1','http_port':8098}])
+    >>> RiakNodeStorage(nodes=[{'host':'127.0.0.1','port':8098}])
     """
-    def __init__(self, nodes, bucket='nodes',
-                 resolver=riak.resolver.last_written_resolver,
-                 protocol='http'):
-        self._client_options = {
-            'nodes': nodes,
-            'resolver': resolver,
-            'protocol': protocol,
-        }
-        self._bucket_name = bucket
-
-    @memoize
-    def conn(self):
-        return riak.RiakClient(**self._client_options)
-
-    @memoize
-    def bucket(self):
-        return self.conn.bucket(self._bucket_name)
-
-    def create(self, data):
-        node_id = self.generate_id()
-        obj = self.bucket.new(data=data, key=node_id)
-        retry(3, obj.store)
-        return obj.key
-
-    def delete(self, id):
-        obj = self.bucket.new(key=id)
-        retry(3, obj.delete)
-
-    def get(self, id):
-        # just fetch it from a random backend, we're not aiming for consistency
-        obj = self.bucket.get(key=id, r=1)
-        if not obj:
-            return None
-        return obj.data
-
-    def get_multi(self, id_list, r=1):
-        result = self.bucket.multiget(id_list)
-
-        results = {}
-        for obj in result:
-            # errors return a tuple of (bucket, key, err)
-            if isinstance(obj, tuple):
-                err = obj[2]
-                six.reraise(type(err), err)
-            results[obj.key] = obj.data
-        return results
+    def __init__(self, nodes, bucket='nodes', timeout=1, cooldown=5,
+                 max_retries=3, multiget_pool_size=5, tcp_keepalive=True,
+                 protocol=None):
+        # protocol being defined is useless, but is needed for backwards
+        # compatability and leveraged as an opportunity to yell at the user
+        if protocol == 'pbc':
+            raise ValueError("'pbc' protocol is no longer supported")
+        if protocol is not None:
+            import warnings
+            warnings.warn("'protocol' has been deprecated",
+                          DeprecationWarning)
+        self.bucket = bucket
+        self.conn = RiakClient(
+            hosts=nodes,
+            max_retries=max_retries,
+            multiget_pool_size=multiget_pool_size,
+            cooldown=cooldown,
+            tcp_keepalive=tcp_keepalive,
+        )
 
     def set(self, id, data):
-        obj = self.bucket.new(key=id, data=data)
-        retry(3, obj.store)
+        self.conn.put(self.bucket, id, json_dumps(data),
+                      returnbody='false')
+
+    def delete(self, id):
+        self.conn.delete(self.bucket, id)
+
+    def get(self, id):
+        rv = self.conn.get(self.bucket, id, r=1)
+        if rv.status != 200:
+            return None
+        return json_loads(rv.data)
+
+    def get_multi(self, id_list):
+        # shortcut for just one id since this is a common
+        # case for us from EventManager.bind_nodes
+        if len(id_list) == 1:
+            id = id_list[0]
+            return {id: self.get(id)}
+
+        rv = self.conn.multiget(self.bucket, id_list, r=1)
+        results = {}
+        for key, value in six.iteritems(rv):
+            if isinstance(value, Exception):
+                six.reraise(type(value), value)
+            if value.status != 200:
+                results[key] = None
+            else:
+                results[key] = json_loads(value.data)
+        return results
 
     def cleanup(self, cutoff_timestamp):
         # TODO(dcramer): we should either index timestamps or have this run

@@ -1,75 +1,147 @@
 from __future__ import absolute_import
 
+from django.db import transaction
+from django.db.models import Q
+from rest_framework import serializers
 from rest_framework.response import Response
 
-from sentry.api.base import Endpoint
-from sentry.api.permissions import assert_perm
+from sentry import roles
+from sentry.api.bases.organization import (
+    OrganizationEndpoint, OrganizationPermission
+)
+from sentry.api.exceptions import ResourceDoesNotExist
 from sentry.models import (
-    AuditLogEntry, AuditLogEntryEvent, Organization, OrganizationMember,
-    OrganizationMemberType
+    AuditLogEntryEvent, AuthIdentity, AuthProvider, OrganizationMember
 )
 
+ERR_NO_AUTH = 'You cannot remove this member with an unauthenticated API request.'
 
-class OrganizationMemberDetailsEndpoint(Endpoint):
+ERR_INSUFFICIENT_ROLE = 'You cannot remove a member who has more access than you.'
+
+ERR_INSUFFICIENT_SCOPE = 'You are missing the member:delete scope.'
+
+ERR_ONLY_OWNER = 'You cannot remove the only remaining owner of the organization.'
+
+ERR_UNINVITABLE = 'You cannot send an invitation to a user who is already a full member.'
+
+
+class OrganizationMemberSerializer(serializers.Serializer):
+    reinvite = serializers.BooleanField()
+
+
+class RelaxedMemberPermission(OrganizationPermission):
+    scope_map = {
+        'GET': ['member:read', 'member:write', 'member:delete'],
+        'POST': ['member:write', 'member:delete'],
+        'PUT': ['member:write', 'member:delete'],
+
+        # DELETE checks for role comparison as you can either remove a member
+        # with a lower access role, or yourself, without having the req. scope
+        'DELETE': ['member:read', 'member:write', 'member:delete'],
+    }
+
+
+class OrganizationMemberDetailsEndpoint(OrganizationEndpoint):
+    permission_classes = [RelaxedMemberPermission]
+
+    def _get_member(self, request, organization, member_id):
+        if member_id == 'me':
+            queryset = OrganizationMember.objects.filter(
+                organization=organization,
+                user__id=request.user.id,
+                user__is_active=True,
+            )
+        else:
+            queryset = OrganizationMember.objects.filter(
+                Q(user__is_active=True) | Q(user__isnull=True),
+                organization=organization,
+                id=member_id,
+            )
+        return queryset.select_related('user').get()
+
     def _is_only_owner(self, member):
-        if member.type != OrganizationMemberType.OWNER:
+        if member.role != roles.get_top_dog().id:
             return False
 
         queryset = OrganizationMember.objects.filter(
             organization=member.organization_id,
-            type=OrganizationMemberType.OWNER,
+            role=roles.get_top_dog().id,
+            user__isnull=False,
+            user__is_active=True,
         ).exclude(id=member.id)
         if queryset.exists():
             return False
 
         return True
 
-    def delete(self, request, organization_slug, member_id):
+    def put(self, request, organization, member_id):
         try:
-            organization = Organization.objects.get_from_cache(
-                slug=organization_slug,
-            )
-        except Organization.DoesNotExist:
-            return Response(status=404)
-
-        assert_perm(organization, request.user, request.auth)
-
-        if request.user.is_superuser:
-            authorizing_access = OrganizationMemberType.OWNER
-        else:
-            authorizing_access = OrganizationMember.objects.get(
-                organization=organization,
-                user=request.user,
-            ).type
-
-        try:
-            om = OrganizationMember.objects.filter(
-                organization=organization,
-                id=member_id,
-                type__gte=authorizing_access,
-            ).select_related('user').get()
+            om = self._get_member(request, organization, member_id)
         except OrganizationMember.DoesNotExist:
-            return Response(status=404)
+            raise ResourceDoesNotExist
+
+        serializer = OrganizationMemberSerializer(data=request.DATA, partial=True)
+        if not serializer.is_valid():
+            return Response(status=400)
+
+        has_sso = AuthProvider.objects.filter(
+            organization=organization,
+        ).exists()
+
+        result = serializer.object
+        # XXX(dcramer): if/when this expands beyond reinvite we need to check
+        # access level
+        if result.get('reinvite'):
+            if om.is_pending:
+                om.send_invite_email()
+            elif has_sso and not getattr(om.flags, 'sso:linked'):
+                om.send_sso_link_email()
+            else:
+                # TODO(dcramer): proper error message
+                return Response({'detail': ERR_UNINVITABLE}, status=400)
+        return Response(status=204)
+
+    def delete(self, request, organization, member_id):
+        try:
+            om = self._get_member(request, organization, member_id)
+        except OrganizationMember.DoesNotExist:
+            raise ResourceDoesNotExist
+
+        if request.user.is_authenticated() and not request.is_superuser():
+            try:
+                acting_member = OrganizationMember.objects.get(
+                    organization=organization,
+                    user=request.user,
+                )
+            except OrganizationMember.DoesNotExist:
+                return Response({'detail': ERR_INSUFFICIENT_ROLE}, status=400)
+            else:
+                if acting_member != om:
+                    if not request.access.has_scope('member:delete'):
+                        return Response({'detail': ERR_INSUFFICIENT_SCOPE}, status=400)
+                    elif not roles.can_manage(acting_member.role, om.role):
+                        return Response({'detail': ERR_INSUFFICIENT_ROLE}, status=400)
+
+        # TODO(dcramer): do we even need this check?
+        elif not request.access.has_scope('member:delete'):
+            return Response({'detail': ERR_INSUFFICIENT_SCOPE}, status=400)
 
         if self._is_only_owner(om):
-            return Response(status=403)
+            return Response({'detail': ERR_ONLY_OWNER}, status=403)
 
         audit_data = om.get_audit_log_data()
 
-        if om.user_id == organization.owner_id:
-            # TODO(dcramer): while we still maintain an owner field on
-            # organization we need to ensure it transfers
-            organization.owner = OrganizationMember.objects.filter(
-                type=OrganizationMemberType.OWNER,
-            ).exclude(id=om.id)[0].user
-            organization.save()
+        with transaction.atomic():
+            AuthIdentity.objects.filter(
+                user=om.user,
+                auth_provider__organization=organization,
+            ).delete()
 
-        om.delete()
+            om.delete()
 
-        AuditLogEntry.objects.create(
+        self.create_audit_entry(
+            request=request,
             organization=organization,
-            actor=request.user,
-            ip_address=request.META['REMOTE_ADDR'],
             target_object=om.id,
             target_user=om.user,
             event=AuditLogEntryEvent.MEMBER_REMOVE,

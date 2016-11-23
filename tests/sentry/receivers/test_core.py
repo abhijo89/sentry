@@ -24,16 +24,14 @@ class CreateDefaultProjectsTest(TestCase):
 
         project = Project.objects.get(id=settings.SENTRY_PROJECT)
         assert project.public is False
-        assert project.name == 'Backend'
-        assert project.slug == 'backend'
+        assert project.name == 'Internal'
+        assert project.slug == 'internal'
         team = project.team
-        assert team.owner == user
         assert team.slug == 'sentry'
 
         pk = ProjectKey.objects.get(project=project)
         assert not pk.roles.api
         assert pk.roles.store
-        assert pk.user is None
 
         # ensure that we dont hit an error here
         create_default_projects(created_models=[Project])
@@ -45,20 +43,16 @@ class CreateDefaultProjectsTest(TestCase):
 
         create_default_projects(created_models=[Project])
 
-        user = User.objects.get(username='sentry')
-
         project = Project.objects.get(id=settings.SENTRY_PROJECT)
         assert project.public is False
-        assert project.name == 'Backend'
-        assert project.slug == 'backend'
+        assert project.name == 'Internal'
+        assert project.slug == 'internal'
         team = project.team
-        assert team.owner == user
         assert team.slug == 'sentry'
 
         pk = ProjectKey.objects.get(project=project)
         assert not pk.roles.api
         assert pk.roles.store
-        assert pk.user is None
 
         # ensure that we dont hit an error here
         create_default_projects(created_models=[Project])

@@ -15,19 +15,25 @@ from sentry.models import ProjectOption
 from sentry.web.forms.fields import RangeField
 
 
-class AlertSettingsForm(forms.Form):
-    pct_threshold = RangeField(
-        label=_('Threshold'), required=False, min_value=0, max_value=1000, step_value=100,
-        help_text=_('Notify when the rate of events increases by this percentage.'))
-    min_events = forms.IntegerField(
-        label=_('Minimum Events'), required=False, min_value=0,
-        help_text=_('Generate an alert only when an event is seen more than this many times during the interval.'),)
+class DigestSettingsForm(forms.Form):
+    minimum_delay = RangeField(
+        label=_('Minimum delivery frequency'),
+        help_text=_('Notifications will be delivered at most this often.'),
+        required=False,
+        min_value=1, max_value=60,
+    )
+    maximum_delay = RangeField(
+        label=_('Maximum delivery frequency'),
+        help_text=_('Notifications will be delivered at least this often.'),
+        required=False,
+        min_value=1, max_value=60,
+    )
 
-
-class NotificationSettingsForm(forms.Form):
-    subject_prefix = forms.CharField(
-        label=_('Mail Subject Prefix'), required=False,
-        help_text=_('Choose a custom prefix for emails from this project.'))
+    def clean(self):
+        cleaned = super(DigestSettingsForm, self).clean()
+        if cleaned['minimum_delay'] > cleaned['maximum_delay']:
+            raise forms.ValidationError(_('Maximum delivery frequency must be equal to or greater than the minimum delivery frequency.'))
+        return cleaned
 
 
 class ProjectQuotasForm(forms.Form):

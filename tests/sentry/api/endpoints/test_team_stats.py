@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 from django.core.urlresolvers import reverse
 
 from sentry.app import tsdb
@@ -8,10 +10,10 @@ class TeamStatsTest(APITestCase):
     def test_simple(self):
         self.login_as(user=self.user)
 
-        team = self.create_team(owner=self.user, name='foo')
+        team = self.create_team(name='foo')
         project_1 = self.create_project(team=team, name='a')
         project_2 = self.create_project(team=team, name='b')
-        team_2 = self.create_team(owner=self.user, name='bar')
+        team_2 = self.create_team(name='bar')
         project_3 = self.create_project(team=team_2, name='c')
 
         tsdb.incr(tsdb.models.project, project_1.id, count=3)
@@ -19,7 +21,8 @@ class TeamStatsTest(APITestCase):
         tsdb.incr(tsdb.models.project, project_3.id, count=10)
 
         url = reverse('sentry-api-0-team-stats', kwargs={
-            'team_id': team.id,
+            'organization_slug': team.organization.slug,
+            'team_slug': team.slug,
         })
         response = self.client.get(url, format='json')
 

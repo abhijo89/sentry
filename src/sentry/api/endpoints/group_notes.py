@@ -1,30 +1,22 @@
 from __future__ import absolute_import
 
 from datetime import timedelta
-from django import forms
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 
-from sentry.api.base import Endpoint
-from sentry.api.permissions import assert_perm
+from sentry.api.base import DocSection
+from sentry.api.bases.group import GroupEndpoint
 from sentry.api.serializers import serialize
-from sentry.models import Group, Activity
+from sentry.api.serializers.rest_framework.group_notes import NoteSerializer
+from sentry.models import Activity, GroupSubscription, GroupSubscriptionReason
 from sentry.utils.functional import extract_lazy_object
 
 
-class NewNoteForm(forms.Form):
-    text = forms.CharField()
+class GroupNotesEndpoint(GroupEndpoint):
+    doc_section = DocSection.EVENTS
 
-
-class GroupNotesEndpoint(Endpoint):
-    def get(self, request, group_id):
-        group = Group.objects.get(
-            id=group_id,
-        )
-
-        assert_perm(group, request.user, request.auth)
-
+    def get(self, request, group):
         notes = Activity.objects.filter(
             group=group,
             type=Activity.NOTE,
@@ -38,35 +30,37 @@ class GroupNotesEndpoint(Endpoint):
             on_results=lambda x: serialize(x, request.user),
         )
 
-    def post(self, request, group_id):
-        group = Group.objects.get(
-            id=group_id,
-        )
+    def post(self, request, group):
+        serializer = NoteSerializer(data=request.DATA)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        assert_perm(group, request.user, request.auth)
-
-        form = NewNoteForm(request.DATA)
-        if not form.is_valid():
-            return Response('{"error": "form"}', status=status.HTTP_400_BAD_REQUEST)
+        data = dict(serializer.object)
 
         if Activity.objects.filter(
             group=group,
             type=Activity.NOTE,
             user=request.user,
-            data=form.cleaned_data,
+            data=data,
             datetime__gte=timezone.now() - timedelta(hours=1)
         ).exists():
-            return Response('{"error": "duplicate"}', status=status.HTTP_400_BAD_REQUEST)
+            return Response('{"detail": "You have already posted that comment."}',
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        GroupSubscription.objects.subscribe(
+            group=group,
+            user=request.user,
+            reason=GroupSubscriptionReason.comment,
+        )
 
         activity = Activity.objects.create(
             group=group,
             project=group.project,
             type=Activity.NOTE,
             user=extract_lazy_object(request.user),
-            data=form.cleaned_data,
+            data=data,
         )
 
-        # TODO: move this into the queue
         activity.send_notification()
 
         return Response(serialize(activity, request.user), status=201)

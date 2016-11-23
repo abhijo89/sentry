@@ -33,6 +33,7 @@ class ProjectOptionManager(BaseManager):
         self.__cache = {}
 
     def _make_key(self, instance_id):
+        assert instance_id
         return '%s:%s' % (self.model._meta.db_table, instance_id)
 
     def get_value_bulk(self, instances, key):
@@ -58,7 +59,7 @@ class ProjectOptionManager(BaseManager):
         self.create_or_update(
             project=project,
             key=key,
-            defaults={
+            values={
                 'value': value,
             },
         )
@@ -111,6 +112,8 @@ class ProjectOption(Model):
     Options which are specific to a plugin should namespace
     their key. e.g. key='myplugin:optname'
     """
+    __core__ = True
+
     project = FlexibleForeignKey('sentry.Project')
     key = models.CharField(max_length=64)
     value = UnicodePickledObjectField()

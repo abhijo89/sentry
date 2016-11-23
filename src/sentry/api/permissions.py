@@ -1,51 +1,56 @@
 from __future__ import absolute_import
 
-from rest_framework.exceptions import PermissionDenied
+from rest_framework import permissions
 
-from sentry.models import (
-    Organization, OrganizationMember, OrganizationMemberType, Project, Team, User
-)
-
-
-def has_perm(object, user, project_key, access=OrganizationMemberType.MEMBER):
-    if not project_key and user.is_superuser:
-        return True
-
-    # TODO: abstract this into a permission registry
-    if type(object) == User:
-        return object == user
-
-    if type(object) == Team:
-        if project_key:
-            return object == project_key.project.team and access == OrganizationMemberType.MEMBER
-        return object in Team.objects.get_for_user(
-            organization=object.organization,
-            user=user,
-            access=access
-        )
-
-    if type(object) == Organization:
-        return OrganizationMember.objects.filter(
-            organization=object,
-            type__lte=access,
-            user=user,
-        ).exists()
-
-    if hasattr(object, 'project'):
-        object = object.project
-
-    if type(object) == Project:
-        if project_key:
-            return object == project_key.project and access == OrganizationMemberType.MEMBER
-        return object in Project.objects.get_for_user(
-            team=object.team,
-            user=user,
-            access=access,
-        )
-
-    raise TypeError(type(object))
+from sentry.models.apikey import ROOT_KEY
+from sentry.auth.utils import is_privileged_request
 
 
-def assert_perm(*args, **kwargs):
-    if not has_perm(*args, **kwargs):
-        raise PermissionDenied
+class NoPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return False
+
+
+class ScopedPermission(permissions.BasePermission):
+    """
+    Permissions work depending on the type of authentication:
+
+    - A user inherits permissions based on their membership role. These are
+      still dictated as common scopes, but they can't be checked until the
+      has_object_permission hook is called.
+    - ProjectKeys (legacy) are granted only project based scopes. This
+    - APIKeys specify their scope, and work as expected.
+    """
+    scope_map = {
+        'HEAD': (),
+        'GET': (),
+        'POST': (),
+        'PUT': (),
+        'PATCH': (),
+        'DELETE': (),
+    }
+
+    def has_permission(self, request, view):
+        # session-based auth has all scopes for a logged in user
+        if not request.auth:
+            return request.user.is_authenticated()
+
+        allowed_scopes = set(self.scope_map.get(request.method, []))
+        current_scopes = request.auth.get_scopes()
+        return any(s in allowed_scopes for s in current_scopes)
+
+    def has_object_permission(self, request, view, obj):
+        return False
+
+
+class SuperuserPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if request.is_superuser():
+            return True
+        return False
+
+
+class SystemPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.auth is ROOT_KEY and \
+            is_privileged_request(request)

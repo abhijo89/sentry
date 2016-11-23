@@ -5,20 +5,14 @@ from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.models import (
-    AuditLogEntry, AuditLogEntryEvent, Organization
-)
-from sentry.permissions import can_create_organizations
+from sentry import features
+from sentry.api import client
 from sentry.web.frontend.base import BaseView
 
 
-class NewOrganizationForm(forms.ModelForm):
+class NewOrganizationForm(forms.Form):
     name = forms.CharField(label=_('Organization Name'), max_length=200,
         widget=forms.TextInput(attrs={'placeholder': _('My Company')}))
-
-    class Meta:
-        fields = ('name',)
-        model = Organization
 
 
 class CreateOrganizationView(BaseView):
@@ -26,27 +20,17 @@ class CreateOrganizationView(BaseView):
         return NewOrganizationForm(request.POST or None)
 
     def has_permission(self, request):
-        if not can_create_organizations(request.user):
-            return False
-        return True
+        return features.has('organizations:create', actor=request.user)
 
     def handle(self, request):
         form = self.get_form(request)
         if form.is_valid():
-            org = form.save(commit=False)
-            org.owner = request.user
-            org.save()
+            resp = client.post('/organizations/', data={
+                'name': form.cleaned_data['name'],
+                'defaultTeam': True,
+            }, request=request)
 
-            AuditLogEntry.objects.create(
-                organization=org,
-                actor=request.user,
-                ip_address=request.META['REMOTE_ADDR'],
-                target_object=org.id,
-                event=AuditLogEntryEvent.ORG_ADD,
-                data=org.get_audit_log_data(),
-            )
-
-            url = reverse('sentry-create-team', args=[org.slug])
+            url = reverse('sentry-create-project', args=[resp.data['slug']])
 
             return HttpResponseRedirect(url)
 

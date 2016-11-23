@@ -9,37 +9,100 @@ from __future__ import absolute_import, print_function
 
 import logging
 import math
+import re
 import six
 import time
+import warnings
 
+from base64 import b16decode, b16encode
 from datetime import timedelta
 from django.core.urlresolvers import reverse
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.app import buffer, tsdb
-from sentry.constants import LOG_LEVELS, MAX_CULPRIT_LENGTH
+from sentry import eventtypes
+from sentry.app import buffer
+from sentry.constants import (
+    DEFAULT_LOGGER_NAME, EVENT_ORDERING_KEY, LOG_LEVELS, MAX_CULPRIT_LENGTH
+)
 from sentry.db.models import (
-    BaseManager, BoundedIntegerField, BoundedPositiveIntegerField,
-    FlexibleForeignKey, Model, GzippedDictField, sane_repr
+    BaseManager, BoundedBigIntegerField, BoundedIntegerField,
+    BoundedPositiveIntegerField, FlexibleForeignKey, GzippedDictField, Model,
+    sane_repr
 )
 from sentry.utils.http import absolute_uri
-from sentry.utils.strings import truncatechars, strip
+from sentry.utils.numbers import base32_decode, base32_encode
+from sentry.utils.strings import strip, truncatechars
+
+logger = logging.getLogger(__name__)
+
+_short_id_re = re.compile(r'^(.*?)(?:[\s_-])([A-Za-z0-9-._]+)$')
+
+
+def looks_like_short_id(value):
+    return _short_id_re.match((value or '').strip()) is not None
 
 
 # TODO(dcramer): pull in enum library
 class GroupStatus(object):
     UNRESOLVED = 0
     RESOLVED = 1
-    MUTED = 2
+    IGNORED = 2
+    PENDING_DELETION = 3
+    DELETION_IN_PROGRESS = 4
+    PENDING_MERGE = 5
+
+    # TODO(dcramer): remove in 9.0
+    MUTED = IGNORED
+
+
+def get_group_with_redirect(id, queryset=None):
+    """
+    Retrieve a group by ID, checking the redirect table if the requested group
+    does not exist. Returns a two-tuple of ``(object, redirected)``.
+    """
+    if queryset is None:
+        queryset = Group.objects.all()
+        # When not passing a queryset, we want to read from cache
+        getter = Group.objects.get_from_cache
+    else:
+        getter = queryset.get
+
+    try:
+        return getter(id=id), False
+    except Group.DoesNotExist as error:
+        from sentry.models import GroupRedirect
+        qs = GroupRedirect.objects.filter(previous_group_id=id).values_list('group_id', flat=True)
+        try:
+            return queryset.get(id=qs), True
+        except Group.DoesNotExist:
+            raise error  # raise original `DoesNotExist`
 
 
 class GroupManager(BaseManager):
     use_for_related_fields = True
 
-    def get_by_natural_key(self, project, checksum):
-        return self.get(project=project, checksum=checksum)
+    def by_qualified_short_id(self, org, short_id):
+        match = _short_id_re.match(short_id.strip())
+        if match is None:
+            raise Group.DoesNotExist()
+        callsign, id = match.groups()
+        callsign = callsign.lower()
+        try:
+            short_id = base32_decode(id)
+            # We need to make sure the short id is not overflowing the
+            # field's max or the lookup will fail with an assertion error.
+            max_id = Group._meta.get_field_by_name('short_id')[0].MAX_VALUE
+            if short_id > max_id:
+                raise ValueError()
+        except ValueError:
+            raise Group.DoesNotExist()
+        return Group.objects.get(
+            project__organization=org,
+            project__slug=callsign,
+            short_id=short_id,
+        )
 
     def from_kwargs(self, project, **kwargs):
         from sentry.event_manager import EventManager
@@ -51,10 +114,8 @@ class GroupManager(BaseManager):
     def add_tags(self, group, tags):
         from sentry.models import TagValue, GroupTagValue
 
-        project = group.project
+        project_id = group.project_id
         date = group.last_seen
-
-        tsdb_keys = []
 
         for tag_item in tags:
             if len(tag_item) == 2:
@@ -62,16 +123,10 @@ class GroupManager(BaseManager):
             else:
                 key, value, data = tag_item
 
-            tsdb_id = u'%s=%s' % (key, value)
-
-            tsdb_keys.extend([
-                (tsdb.models.project_tag_value, tsdb_id),
-            ])
-
             buffer.incr(TagValue, {
                 'times_seen': 1,
             }, {
-                'project': project,
+                'project_id': project_id,
                 'key': key,
                 'value': value,
             }, {
@@ -82,25 +137,24 @@ class GroupManager(BaseManager):
             buffer.incr(GroupTagValue, {
                 'times_seen': 1,
             }, {
-                'group': group,
-                'project': project,
+                'group_id': group.id,
                 'key': key,
                 'value': value,
             }, {
+                'project': project_id,
                 'last_seen': date,
             })
-
-        if tsdb_keys:
-            tsdb.incr_multi(tsdb_keys)
 
 
 class Group(Model):
     """
     Aggregated message which summarizes a set of Events.
     """
+    __core__ = False
+
     project = FlexibleForeignKey('sentry.Project', null=True)
     logger = models.CharField(
-        max_length=64, blank=True, default='root', db_index=True)
+        max_length=64, blank=True, default=DEFAULT_LOGGER_NAME, db_index=True)
     level = BoundedPositiveIntegerField(
         choices=LOG_LEVELS.items(), default=logging.ERROR, blank=True,
         db_index=True)
@@ -108,17 +162,18 @@ class Group(Model):
     culprit = models.CharField(
         max_length=MAX_CULPRIT_LENGTH, blank=True, null=True,
         db_column='view')
-    checksum = models.CharField(max_length=32, db_index=True)
     num_comments = BoundedPositiveIntegerField(default=0, null=True)
     platform = models.CharField(max_length=64, null=True)
     status = BoundedPositiveIntegerField(default=0, choices=(
         (GroupStatus.UNRESOLVED, _('Unresolved')),
         (GroupStatus.RESOLVED, _('Resolved')),
-        (GroupStatus.MUTED, _('Muted')),
+        (GroupStatus.IGNORED, _('Ignored')),
     ), db_index=True)
     times_seen = BoundedPositiveIntegerField(default=1, db_index=True)
     last_seen = models.DateTimeField(default=timezone.now, db_index=True)
     first_seen = models.DateTimeField(default=timezone.now, db_index=True)
+    first_release = FlexibleForeignKey('sentry.Release', null=True,
+                                       on_delete=models.PROTECT)
     resolved_at = models.DateTimeField(null=True, db_index=True)
     # active_at should be the same as first_seen by default
     active_at = models.DateTimeField(null=True, db_index=True)
@@ -127,20 +182,26 @@ class Group(Model):
     score = BoundedIntegerField(default=0)
     is_public = models.NullBooleanField(default=False, null=True)
     data = GzippedDictField(blank=True, null=True)
+    short_id = BoundedBigIntegerField(null=True)
 
     objects = GroupManager()
 
     class Meta:
         app_label = 'sentry'
         db_table = 'sentry_groupedmessage'
-        unique_together = (('project', 'checksum'),)
         verbose_name_plural = _('grouped messages')
         verbose_name = _('grouped message')
         permissions = (
             ("can_view", "Can view"),
         )
+        index_together = (
+            ('project', 'first_release'),
+        )
+        unique_together = (
+            ('project', 'short_id'),
+        )
 
-    __repr__ = sane_repr('project_id', 'checksum')
+    __repr__ = sane_repr('project_id')
 
     def __unicode__(self):
         return "(%s) %s" % (self.times_seen, self.error())
@@ -152,9 +213,10 @@ class Group(Model):
             self.first_seen = self.last_seen
         if not self.active_at:
             self.active_at = self.first_seen
+        # We limit what we store for the message body
+        self.message = strip(self.message)
         if self.message:
-            # We limit what we store for the message body
-            self.message = self.message.splitlines()[0][:255]
+            self.message = truncatechars(self.message.splitlines()[0], 255)
         super(Group, self).save(*args, **kwargs)
 
     def get_absolute_url(self):
@@ -162,13 +224,17 @@ class Group(Model):
             self.organization.slug, self.project.slug, self.id]))
 
     @property
-    def avg_time_spent(self):
-        if not self.time_spent_count:
-            return
-        return float(self.time_spent_total) / self.time_spent_count
+    def qualified_short_id(self):
+        if self.short_id is not None:
+            return '%s-%s' % (
+                self.project.slug.upper(),
+                base32_encode(self.short_id),
+            )
 
-    def natural_key(self):
-        return (self.project, self.checksum)
+    @property
+    def event_set(self):
+        from sentry.models import Event
+        return Event.objects.filter(group_id=self.id)
 
     def is_over_resolve_age(self):
         resolve_age = self.project.get_option('sentry:resolve_age', None)
@@ -176,16 +242,52 @@ class Group(Model):
             return False
         return self.last_seen < timezone.now() - timedelta(hours=int(resolve_age))
 
-    def is_muted(self):
-        return self.get_status() == GroupStatus.MUTED
+    def is_ignored(self):
+        return self.get_status() == GroupStatus.IGNORED
+
+    # TODO(dcramer): remove in 9.0 / after plugins no long ref
+    is_muted = is_ignored
 
     def is_resolved(self):
         return self.get_status() == GroupStatus.RESOLVED
 
     def get_status(self):
+        # XXX(dcramer): GroupSerializer reimplements this logic
+        from sentry.models import GroupSnooze
+
+        if self.status == GroupStatus.IGNORED:
+            try:
+                snooze = GroupSnooze.objects.get(group=self)
+            except GroupSnooze.DoesNotExist:
+                pass
+            else:
+                # XXX(dcramer): if the snooze row exists then we need
+                # to confirm its still valid
+                if snooze.until > timezone.now():
+                    return GroupStatus.IGNORED
+                else:
+                    return GroupStatus.UNRESOLVED
+
         if self.status == GroupStatus.UNRESOLVED and self.is_over_resolve_age():
             return GroupStatus.RESOLVED
         return self.status
+
+    def get_share_id(self):
+        return b16encode(
+            ('{}.{}'.format(self.project_id, self.id)).encode('utf-8')
+        ).lower().decode('utf-8')
+
+    @classmethod
+    def from_share_id(cls, share_id):
+        if not share_id:
+            raise cls.DoesNotExist
+        try:
+            project_id, group_id = b16decode(share_id.upper()).decode('utf-8').split('.')
+        except (ValueError, TypeError):
+            raise cls.DoesNotExist
+        if not (project_id.isdigit() and group_id.isdigit()):
+            raise cls.DoesNotExist
+        return cls.objects.get(project=project_id, id=group_id)
 
     def get_score(self):
         return int(math.log(self.times_seen) * 600 + float(time.mktime(self.last_seen.timetuple())))
@@ -194,13 +296,34 @@ class Group(Model):
         from sentry.models import Event
 
         if not hasattr(self, '_latest_event'):
+            latest_events = sorted(
+                Event.objects.filter(
+                    group_id=self.id,
+                ).order_by('-datetime')[0:5],
+                key=EVENT_ORDERING_KEY,
+                reverse=True,
+            )
             try:
-                self._latest_event = Event.objects.filter(
-                    group=self,
-                ).order_by('-datetime')[0]
+                self._latest_event = latest_events[0]
             except IndexError:
                 self._latest_event = None
         return self._latest_event
+
+    def get_oldest_event(self):
+        from sentry.models import Event
+
+        if not hasattr(self, '_oldest_event'):
+            oldest_events = sorted(
+                Event.objects.filter(
+                    group_id=self.id,
+                ).order_by('datetime')[0:5],
+                key=EVENT_ORDERING_KEY,
+            )
+            try:
+                self._oldest_event = oldest_events[0]
+            except IndexError:
+                self._oldest_event = None
+        return self._oldest_event
 
     def get_unique_tags(self, tag, since=None, order_by='-times_seen'):
         # TODO(dcramer): this has zero test coverage and is a critical path
@@ -257,29 +380,50 @@ class Group(Model):
 
         return self._tag_cache
 
-    def error(self):
-        return self.message
-    error.short_description = _('error')
+    def get_event_type(self):
+        """
+        Return the type of this issue.
 
-    def has_two_part_message(self):
-        message = strip(self.message)
-        return '\n' in message or len(message) > 100
+        See ``sentry.eventtypes``.
+        """
+        return self.data.get('type', 'default')
+
+    def get_event_metadata(self):
+        """
+        Return the metadata of this issue.
+
+        See ``sentry.eventtypes``.
+        """
+        etype = self.data.get('type')
+        if etype is None:
+            etype = 'default'
+        if 'metadata' not in self.data:
+            data = self.data.copy() if self.data else {}
+            data['message'] = self.message
+            return eventtypes.get(etype)(data).get_metadata()
+        return self.data['metadata']
 
     @property
     def title(self):
-        culprit = strip(self.culprit)
-        if culprit:
-            return culprit
-        return self.message
+        et = eventtypes.get(self.get_event_type())(self.data)
+        return et.to_string(self.get_event_metadata())
+
+    def error(self):
+        warnings.warn('Group.error is deprecated, use Group.title',
+                      DeprecationWarning)
+        return self.title
+    error.short_description = _('error')
 
     @property
     def message_short(self):
-        message = strip(self.message)
-        if not message:
-            message = '<unlabeled message>'
-        else:
-            message = truncatechars(message.splitlines()[0], 100)
-        return message
+        warnings.warn('Group.message_short is deprecated, use Group.title',
+                      DeprecationWarning)
+        return self.title
+
+    def has_two_part_message(self):
+        warnings.warn('Group.has_two_part_message is no longer used',
+                      DeprecationWarning)
+        return False
 
     @property
     def organization(self):
@@ -289,10 +433,14 @@ class Group(Model):
     def team(self):
         return self.project.team
 
+    @property
+    def checksum(self):
+        warnings.warn('Group.checksum is no longer used', DeprecationWarning)
+        return ''
+
     def get_email_subject(self):
-        return '[%s %s] %s: %s' % (
-            self.team.name.encode('utf-8'),
-            self.project.name.encode('utf-8'),
+        return '[%s] %s: %s' % (
+            self.project.get_full_name().encode('utf-8'),
             six.text_type(self.get_level_display()).upper().encode('utf-8'),
-            self.message_short.encode('utf-8')
+            self.title.encode('utf-8')
         )

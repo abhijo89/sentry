@@ -7,82 +7,73 @@ sentry.quotas.redis
 """
 from __future__ import absolute_import
 
-from django.conf import settings
-from nydus.db import create_cluster
-from sentry.quotas.base import Quota, RateLimited, NotRateLimited
+import six
 
+from time import time
 
-import time
+from sentry.exceptions import InvalidConfiguration
+from sentry.quotas.base import NotRateLimited, Quota, RateLimited
+from sentry.utils.redis import get_cluster_from_options, load_script
+
+is_rate_limited = load_script('quotas/is_rate_limited.lua')
 
 
 class RedisQuota(Quota):
-    ttl = 60
+    #: The ``grace`` period allows accomodating for clock drift in TTL
+    #: calculation since the clock on the Redis instance used to store quota
+    #: metrics may not be in sync with the computer running this code.
+    grace = 60
 
     def __init__(self, **options):
-        if not options:
-            # inherit default options from REDIS_OPTIONS
-            options = settings.SENTRY_REDIS_OPTIONS
+        self.cluster, options = get_cluster_from_options('SENTRY_QUOTA_OPTIONS', options)
         super(RedisQuota, self).__init__(**options)
-        options.setdefault('hosts', {0: {}})
-        options.setdefault('router', 'nydus.db.routers.keyvalue.PartitionRouter')
-        self.conn = create_cluster({
-            'engine': 'nydus.db.backends.redis.Redis',
-            'router': options['router'],
-            'hosts': options['hosts'],
-        })
+        self.namespace = 'quota'
+
+    def validate(self):
+        try:
+            with self.cluster.all() as client:
+                client.ping()
+        except Exception as e:
+            raise InvalidConfiguration(six.text_type(e))
+
+    def get_quotas(self, project):
+        return (
+            ('p:{}'.format(project.id), self.get_project_quota(project), 60),
+            ('o:{}'.format(project.organization.id), self.get_organization_quota(project.organization), 60),
+        )
+
+    def get_redis_key(self, key, timestamp, interval):
+        return '{}:{}:{}'.format(self.namespace, key, int(timestamp // interval))
 
     def is_rate_limited(self, project):
-        proj_quota = self.get_project_quota(project)
-        if project.team:
-            team_quota = self.get_team_quota(project.team)
-        else:
-            team_quota = 0
-        system_quota = self.get_system_quota()
+        timestamp = time()
 
-        if not (proj_quota or system_quota or team_quota):
+        quotas = [
+            (key, limit, interval)
+            for key, limit, interval in self.get_quotas(project)
+            # x = (key, limit, interval)
+            if limit and limit > 0  # a zero limit means "no limit", not "reject all"
+        ]
+
+        # If there are no quotas to actually check, skip the trip to the database.
+        if not quotas:
             return NotRateLimited
 
-        sys_result, team_result, proj_result = self._incr_project(project)
+        def get_next_period_start(interval):
+            """Return the timestamp when the next rate limit period begins for an interval."""
+            return ((timestamp // interval) + 1) * interval
 
-        if proj_quota and proj_result > proj_quota:
-            return RateLimited(retry_after=self.get_time_remaining())
+        keys = []
+        args = []
+        for key, limit, interval in quotas:
+            keys.append(self.get_redis_key(key, timestamp, interval))
+            expiry = get_next_period_start(interval) + self.grace
+            args.extend((limit, int(expiry)))
 
-        if team_quota and team_result > team_quota:
-            return RateLimited(retry_after=self.get_time_remaining())
-
-        if system_quota and sys_result > system_quota:
-            return RateLimited(retry_after=self.get_time_remaining())
-
-        return NotRateLimited
-
-    def get_time_remaining(self):
-        return int(self.ttl - (time.time() - int(time.time() / self.ttl) * self.ttl))
-
-    def _get_system_key(self):
-        return 'quota:s:%s' % (int(time.time() / self.ttl),)
-
-    def _get_team_key(self, team):
-        return 'quota:t:%s:%s' % (team.id, int(time.time() / self.ttl))
-
-    def _get_project_key(self, project):
-        return 'quota:p:%s:%s' % (project.id, int(time.time() / self.ttl))
-
-    def _incr_project(self, project):
-        if project.team:
-            team_key = self._get_team_key(project.team)
+        client = self.cluster.get_local_client_for_key(six.text_type(project.organization.pk))
+        rejections = is_rate_limited(client, keys, args)
+        if any(rejections):
+            delay = max(get_next_period_start(interval) - timestamp for (key, limit, interval), rejected in zip(quotas, rejections) if rejected)
+            return RateLimited(retry_after=delay)
         else:
-            team_key = None
-            team_result = 0
-
-        proj_key = self._get_project_key(project)
-        sys_key = self._get_system_key()
-        with self.conn.map() as conn:
-            proj_result = conn.incr(proj_key)
-            conn.expire(proj_key, self.ttl)
-            sys_result = conn.incr(sys_key)
-            conn.expire(sys_key, self.ttl)
-            if team_key:
-                team_result = conn.incr(team_key)
-                conn.expire(team_key, self.ttl)
-
-        return int(sys_result), int(team_result), int(proj_result)
+            return NotRateLimited

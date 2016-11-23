@@ -2,10 +2,7 @@
 
 from __future__ import absolute_import
 
-from sentry.constants import MEMBER_OWNER, MEMBER_USER
-from sentry.models import (
-    Group, Team, User, AccessGroup, GroupTagValue
-)
+from sentry.models import Group, GroupTagValue, Team, User
 from sentry.testutils import TestCase
 
 
@@ -20,7 +17,7 @@ class SentryManagerTest(TestCase):
         event = Group.objects.from_kwargs(1, message='rrr')
         group = event.group
 
-        with self.settings(CELERY_ALWAYS_EAGER=True):
+        with self.tasks():
             Group.objects.add_tags(group, tags=(('foo', 'bar'), ('foo', 'baz'), ('biz', 'boz')))
 
         results = list(GroupTagValue.objects.filter(
@@ -45,36 +42,25 @@ class TeamManagerTest(TestCase):
     def test_simple(self):
         user = User.objects.create(username='foo')
         user2 = User.objects.create(username='bar')
-        user3 = User.objects.create(username='baz')
-        org = self.create_organization(owner=user)
+        org = self.create_organization()
         team = self.create_team(organization=org, name='Test')
-        group = AccessGroup.objects.create(name='Test', type=MEMBER_USER, team=team)
-        group.members.add(user2)
+        self.create_member(organization=org, user=user, teams=[team])
 
         result = Team.objects.get_for_user(
             organization=org,
             user=user,
-            access=MEMBER_OWNER,
         )
         assert result == [team]
 
         result = Team.objects.get_for_user(
             organization=org,
-            user=user2,
-            access=MEMBER_OWNER,
+            user=user,
+            scope='idontexist',
         )
         assert result == []
 
         result = Team.objects.get_for_user(
             organization=org,
-            user=user,
-            access=MEMBER_USER,
-        )
-        assert result == [team]
-
-        result = Team.objects.get_for_user(
-            organization=org,
-            user=user3,
-            access=MEMBER_OWNER,
+            user=user2,
         )
         assert result == []

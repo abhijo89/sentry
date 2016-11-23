@@ -7,99 +7,171 @@ sentry.utils.http
 """
 from __future__ import absolute_import
 
-import re
 import sentry
+
+import ipaddress
+import six
 import socket
-import urllib2
-import zlib
+import requests
+import warnings
 
+from sentry import options
 from django.conf import settings
-from django.core.exceptions import SuspiciousOperation
-from ipaddr import IPNetwork
-from urlparse import urlparse
+from requests.adapters import HTTPAdapter
+from requests.exceptions import SSLError
+from six.moves.urllib.parse import urlparse
 
-CHARSET_RE = re.compile(r'charset=(\S+)')
+from sentry.exceptions import RestrictedIPAddress
 
-DEFAULT_ENCODING = 'utf-8'
+# In case SSL is unavailable (light builds) we can't import this here.
+try:
+    from OpenSSL.SSL import ZeroReturnError
+except ImportError:
+    class ZeroReturnError(Exception):
+        pass
 
-DEFAULT_HEADERS = (
-    ('Accept-Encoding', 'gzip'),
+USER_AGENT = 'sentry/{version} (https://sentry.io)'.format(
+    version=sentry.VERSION,
 )
 
-DEFAULT_USER_AGENT = 'sentry/%s' % sentry.VERSION
+DISALLOWED_IPS = {
+    ipaddress.ip_network(six.text_type(i), strict=False)
+    for i in settings.SENTRY_DISALLOWED_IPS
+}
 
-DISALLOWED_IPS = set((IPNetwork(i) for i in settings.SENTRY_DISALLOWED_IPS))
 
-
-class NoRedirectionHandler(urllib2.HTTPErrorProcessor):
-    def http_response(self, request, response):
-        return response
-
-    https_response = http_response
+def get_server_hostname():
+    return urlparse(options.get('system.url-prefix')).hostname
 
 
 def is_valid_url(url):
     """
     Tests a URL to ensure it doesn't appear to be a blacklisted IP range.
     """
+    # If we have no disallowed ips, we can skip any further validation
+    # and there's no point in doing a DNS lookup to validate against
+    # an empty list.
+    if not DISALLOWED_IPS:
+        return True
+
     parsed = urlparse(url)
     if not parsed.hostname:
         return False
 
+    server_hostname = get_server_hostname()
+
+    if parsed.hostname == server_hostname:
+        return True
+
+    # NOTE: The use of `socket.gethostbyname` is slightly flawed.
+    # `gethostbyname` doesn't handle octal IP addresses correctly, nor
+    # does it fetch all of the IP addresses for the record.
+    # `getaddrinfo` does the correct thing with octals here, and also returns all
+    # ip addresses for the hostname.
+    #
+    # WARNING: This behavior is only correct on Linux. On OSX, `getaddrinfo` also
+    # returns the wrong IP.
+    #
+    # The following should all technically resolve to `127.0.0.1`:
+    # Python 2.7.11 Linux
+    # >>> socket.gethostbyname('0177.0000.0000.0001')
+    # '177.0.0.1'
+    # >>> socket.getaddrinfo('0177.0000.0000.0001', 0)[0]
+    # (2, 1, 6, '', ('127.0.0.1', 0))
+    # Python 2.7.11 macOS
+    # >>> socket.gethostbyname('0177.0000.0000.0001')
+    # '177.0.0.1'
+    # >>> socket.getaddrinfo('0177.0000.0000.0001', None)[0]
+    # (2, 2, 17, '', ('177.0.0.1', 0))
     try:
-        ip_address = socket.gethostbyname(parsed.hostname)
+        ip_addresses = set(addr for _, _, _, _, addr in socket.getaddrinfo(parsed.hostname, 0))
     except socket.gaierror:
         return False
 
-    ip_network = IPNetwork(ip_address)
-    for addr in DISALLOWED_IPS:
-        if ip_network in addr:
-            return False
+    for addr in ip_addresses:
+        ip_address = addr[0]
+        if ip_address == server_hostname:
+            return True
+
+        ip_address = ipaddress.ip_address(six.text_type(ip_address))
+        for ip_network in DISALLOWED_IPS:
+            if ip_address in ip_network:
+                return False
 
     return True
 
 
-def safe_urlopen(url, data=None, headers=DEFAULT_HEADERS,
-                 user_agent=DEFAULT_USER_AGENT, allow_redirects=False,
-                 timeout=30):
+class BlacklistAdapter(HTTPAdapter):
+    def send(self, request, *args, **kwargs):
+        if not is_valid_url(request.url):
+            raise RestrictedIPAddress('%s matches the URL blacklist' % (request.url,))
+        return super(BlacklistAdapter, self).send(request, *args, **kwargs)
+
+
+def build_session():
+    session = requests.Session()
+    session.headers.update({'User-Agent': USER_AGENT})
+    session.mount('https://', BlacklistAdapter())
+    session.mount('http://', BlacklistAdapter())
+    return session
+
+
+def safe_urlopen(url, method=None, params=None, data=None, json=None,
+                 headers=None, allow_redirects=False, timeout=30,
+                 verify_ssl=True, user_agent=None):
     """
     A slightly safer version of ``urlib2.urlopen`` which prevents redirection
     and ensures the URL isn't attempting to hit a blacklisted IP range.
     """
-    if not is_valid_url(url):
-        raise SuspiciousOperation('%s matches the URL blacklist' % (url,))
+    if user_agent is not None:
+        warnings.warn('user_agent is no longer used with safe_urlopen')
 
-    req = urllib2.Request(url, data)
-    req.add_header('User-Agent', user_agent)
-    for key, value in headers:
-        req.add_header(key, value)
+    session = build_session()
 
-    handlers = []
-    if not allow_redirects:
-        handlers.append(NoRedirectionHandler)
+    kwargs = {}
 
-    opener = urllib2.build_opener(*handlers)
+    if json:
+        kwargs['json'] = json
+        if not headers:
+            headers = {}
+        headers.setdefault('Content-Type', 'application/json')
 
-    return opener.open(req, timeout=timeout)
+    if data:
+        kwargs['data'] = data
+
+    if params:
+        kwargs['params'] = params
+
+    if headers:
+        kwargs['headers'] = headers
+
+    if method is None:
+        method = 'POST' if (data or json) else 'GET'
+
+    try:
+        response = session.request(
+            method=method,
+            url=url,
+            allow_redirects=allow_redirects,
+            timeout=timeout,
+            verify=verify_ssl,
+            **kwargs
+        )
+    # Our version of requests does not transform ZeroReturnError into an
+    # appropriately generically catchable exception
+    except ZeroReturnError as exc:
+        import sys
+        exc_tb = sys.exc_info()[2]
+        six.reraise(SSLError, exc, exc_tb)
+        del exc_tb
+
+    # requests' attempts to use chardet internally when no encoding is found
+    # and we want to avoid that slow behavior
+    if not response.encoding:
+        response.encoding = 'utf-8'
+
+    return response
 
 
-def safe_urlread(request):
-    body = request.read()
-
-    if request.headers.get('content-encoding') == 'gzip':
-        # Content doesn't *have* to respect the Accept-Encoding header
-        # and may send gzipped data regardless.
-        # See: http://stackoverflow.com/questions/2423866/python-decompressing-gzip-chunk-by-chunk/2424549#2424549
-        body = zlib.decompress(body, 16 + zlib.MAX_WBITS)
-
-    content_type = request.headers.get('content-type')
-    if content_type is None:
-        # If there is no content_type header at all, quickly assume default utf-8 encoding
-        encoding = DEFAULT_ENCODING
-    else:
-        try:
-            encoding = CHARSET_RE.search(content_type).group(1)
-        except AttributeError:
-            encoding = DEFAULT_ENCODING
-
-    return body.decode(encoding).rstrip('\n')
+def safe_urlread(response):
+    return response.content
